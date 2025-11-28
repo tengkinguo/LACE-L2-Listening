@@ -1,0 +1,14 @@
+# Raw & processed large files (reproducible)
+data/raw/*
+data/processed/*
+
+# Training outputs
+results/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
