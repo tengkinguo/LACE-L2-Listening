@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Created on Fri Nov 28 09:57:51 2025
+Created on Thu Dec  4 16:48:28 2025
 
 @author: T
 """
 
+# -*- coding: utf-8 -*-
 """
 Script: LGBM_calibrated.py
 Location: scripts/baselines/LGBM_calibrated.py
@@ -12,41 +13,44 @@ Location: scripts/baselines/LGBM_calibrated.py
 Description:
     Implements the LightGBM baseline with Isotonic Calibration.
     
+    CRITICAL UPDATE (Fair Comparison):
+    This script now loads 'fe_data.parquet' to access the EXACT same feature set 
+    used by the LACE model. This includes:
+      - Lexical: Word Frequency, Word Length
+      - Phonological: Syllable Count, Challenging Phoneme Flag
+      - Behavioral: Rolling Accuracy, Time gaps
+      - Context: Client, Country, Session, POS Tags (handled as categorical)
+
     Pipeline:
-    1. Preprocessing: Parsing logs and extracting rolling behavioral features.
-    2. Splitting: Strict User-level split (60% Train, 20% Val, 20% Test).
-    3. Training: Fits LightGBM on the Training set (with early stopping on Val).
-    4. Calibration: Fits Isotonic Regression on the Validation set probabilities.
-    5. Evaluation: Runs 3 independent trials and reports Mean ± Std for Table 1 metrics.
+    1. Load Preprocessed Data ('fe_data.parquet').
+    2. Split: User-level split (70% Train, 15% Val, 15% Test) matching LACE.
+    3. Train: LightGBM on Train set (with Early Stopping on Val).
+    4. Calibrate: Isotonic Regression on Validation set probabilities.
+    5. Evaluate: Reports AUC, F1, ECE (Raw), ECE (Calibrated) over 3 runs.
 
 Usage:
-    Run from the project root:
     python scripts/baselines/LGBM_calibrated.py
 """
 
 import os
-import ast
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+import lightgbm as lgb
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score, f1_score
-import lightgbm as lgb
 
 # --- Configuration & Path Setup ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../"))
-RAW_DATA_PATH = os.path.join(PROJECT_ROOT, "data", "raw", "slam.listen.train")
-
-COLUMN_NAMES = [
-    'user', 'exercise_id', 'instance_id', 'token', 'client',
-    'countries', 'session', 'days', 'time', 'label'
-]
+# Using the exact same feature file as LACE
+FEAT_DATA_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "fe_data.parquet")
 
 # --- Helper Functions ---
 
 def compute_ece(y_true, y_prob, n_bins=10):
-    """Calculates Expected Calibration Error (ECE)."""
+    """
+    Calculates the Expected Calibration Error (ECE).
+    """
     bins = np.linspace(0.0, 1.0, n_bins + 1)
     bin_ids = np.digitize(y_prob, bins) - 1
     
@@ -63,140 +67,126 @@ def compute_ece(y_true, y_prob, n_bins=10):
             
     return ece
 
-def parse_countries(x):
-    """Parses list string to extract country code."""
-    try:
-        arr = ast.literal_eval(x)
-        if isinstance(arr, list) and len(arr) > 0:
-            return arr[0]
-        else:
-            return 'Unknown'
-    except Exception:
-        return 'Unknown'
-
-def run_experiment(run_id):
-    """Runs a single experiment iteration (Train -> Calibrate -> Test)."""
+def run_experiment(run_id, df):
+    """
+    Runs a single complete experiment iteration.
+    """
     print(f"\n--- Starting Run {run_id+1}/3 ---")
     
-    # 1. Load Data
-    if not os.path.exists(RAW_DATA_PATH):
-        raise FileNotFoundError(f"Raw data not found at: {RAW_DATA_PATH}")
-    
-    df = pd.read_csv(RAW_DATA_PATH, header=None, names=COLUMN_NAMES, sep='\t', dtype=str)
-
-    # 2. Preprocessing
-    df['days'] = pd.to_numeric(df['days'], errors='coerce')
-    df['time'] = pd.to_numeric(df['time'], errors='coerce')
-    df['country'] = df['countries'].apply(parse_countries)
-
-    df['token_sequence_order'] = (
-        df['instance_id'].str[-2:]
-        .apply(lambda s: pd.to_numeric(s, errors='coerce'))
-        .fillna(0).astype(int)
-    )
-    
-    df['sentence_length'] = df.groupby('exercise_id')['token'].transform('count')
-
-    # Rolling History Accuracy
-    df = df.sort_values(by=['user', 'days', 'time', 'token_sequence_order']).reset_index(drop=True)
-    df['label_float'] = pd.to_numeric(df['label'], errors='coerce').fillna(0.0)
-    
-    df['cum_correct'] = df.groupby('user')['label_float'].cumsum()
-    df['cum_total'] = df.groupby('user').cumcount() + 1
-    df['user_history_accuracy'] = (df['cum_correct'] - df['label_float']) / (df['cum_total'] - 1)
-    df['user_history_accuracy'] = df['user_history_accuracy'].fillna(0.5)
-
-    # Fill Missing Values
-    for col in ['days', 'time']:
-        if df[col].isnull().any(): df[col] = df[col].fillna(df[col].median())
-    for col in ['client', 'country', 'session']:
-        df[col] = df[col].fillna('Unknown')
-
-    # 3. Splitting (Dynamic Seed)
+    # 1. User-Level Data Splitting (Match LACE logic: 70/15/15)
     unique_users = df['user'].unique()
-    current_seed = 42 + run_id
+    
+    # Dynamic seed ensures we test robustness across different splits
+    # To exactly match LACE's specific run, use seed=42 for run 0.
+    current_seed = 42 + run_id 
     np.random.seed(current_seed)
     np.random.shuffle(unique_users)
 
     n_users = len(unique_users)
-    n_train = int(n_users * 0.6)
-    n_val = int(n_users * 0.2)
+    n_train = int(n_users * 0.70)
+    n_val = int(n_users * 0.15)
     
-    train_users = unique_users[:n_train]
-    val_users = unique_users[n_train : n_train + n_val]
-    test_users = unique_users[n_train + n_val:]
+    train_users = set(unique_users[:n_train])
+    val_users = set(unique_users[n_train : n_train + n_val])
+    test_users = set(unique_users[n_train + n_val:])
 
-    train_df = df[df['user'].isin(train_users)].reset_index(drop=True)
-    val_df = df[df['user'].isin(val_users)].reset_index(drop=True)
-    test_df = df[df['user'].isin(test_users)].reset_index(drop=True)
+    train_mask = df['user'].isin(train_users)
+    val_mask = df['user'].isin(val_users)
+    test_mask = df['user'].isin(test_users)
 
-    # 4. Feature Prep
-    numeric_features = ['days', 'time', 'token_sequence_order', 'sentence_length', 'user_history_accuracy']
-    categorical_features = ['client', 'country', 'session']
+    # 2. Feature Selection
+    # We select the scaled features for consistency, but tree models handle unscaled fine too.
+    # We also include categorical IDs which LightGBM handles natively.
     
-    y_train = train_df['label_float'].values
-    y_val = val_df['label_float'].values
-    y_test = test_df['label_float'].values
+    numeric_cols = [
+        # Lexical (LACE equivalent)
+        'word_freq_scaled',
+        'word_length_scaled',
+        # Phonological (LACE equivalent)
+        'num_syllables_scaled',
+        'is_challenging_phoneme', # Binary
+        # Behavioral
+        'user_history_accuracy_scaled',
+        'days_scaled',
+        'time_scaled'
+    ]
+    
+    # Categorical Context Features
+    # Note: These correspond to LACE's embeddings (User, Client, Country, Session, POS)
+    categorical_cols = [
+        'client_id', 
+        'countries_id', 
+        'session_id', 
+        'pos_tag_id'
+    ]
+    
+    feature_cols = numeric_cols + categorical_cols
+    target_col = 'label'
 
-    # Convert categoricals to 'category' dtype for LGBM
-    for col in categorical_features:
-        train_df[col] = train_df[col].astype('category')
-        val_df[col] = val_df[col].astype('category')
-        test_df[col] = test_df[col].astype('category')
+    # Prepare Dataframes
+    # LightGBM requires specific category dtype for categorical features
+    X_train = df.loc[train_mask, feature_cols].copy()
+    y_train = df.loc[train_mask, target_col].values.astype(int)
+    
+    X_val = df.loc[val_mask, feature_cols].copy()
+    y_val = df.loc[val_mask, target_col].values.astype(int)
+    
+    X_test = df.loc[test_mask, feature_cols].copy()
+    y_test = df.loc[test_mask, target_col].values.astype(int)
 
-    # Scale numerics
-    scaler = StandardScaler()
-    train_df[numeric_features] = scaler.fit_transform(train_df[numeric_features])
-    val_df[numeric_features] = scaler.transform(val_df[numeric_features])
-    test_df[numeric_features] = scaler.transform(test_df[numeric_features])
+    # Convert categorical columns to 'category' dtype
+    for col in categorical_cols:
+        X_train[col] = X_train[col].astype('category')
+        X_val[col] = X_val[col].astype('category')
+        X_test[col] = X_test[col].astype('category')
 
-    X_train = train_df[numeric_features + categorical_features]
-    X_val = val_df[numeric_features + categorical_features]
-    X_test = test_df[numeric_features + categorical_features]
+    print(f"Train size: {len(X_train)}, Val size: {len(X_val)}, Test size: {len(X_test)}")
 
-    # 5. Train LightGBM
-    # Calculate scale_pos_weight for class imbalance
+    # 3. Train LightGBM
+    # Handle Class Imbalance
     pos_count = np.sum(y_train == 1)
     neg_count = len(y_train) - pos_count
-    scale_weight = neg_count / pos_count if pos_count > 0 else 1
+    scale_weight = neg_count / pos_count if pos_count > 0 else 1.0
 
     lgb_model = lgb.LGBMClassifier(
         objective='binary',
         metric='auc',
-        n_estimators=500,
+        n_estimators=1000,      # High number, controlled by early stopping
         learning_rate=0.05,
         num_leaves=31,
+        max_depth=-1,
         random_state=current_seed,
         scale_pos_weight=scale_weight,
-        n_jobs=-1
+        n_jobs=-1,
+        importance_type='gain'
     )
     
-    # Use Validation set for Early Stopping
+    # Callbacks for logging and stopping
     callbacks = [
         lgb.early_stopping(stopping_rounds=50, verbose=False),
-        lgb.log_evaluation(period=0)
+        lgb.log_evaluation(period=0) # Silence logs
     ]
     
     lgb_model.fit(
         X_train, y_train,
         eval_set=[(X_val, y_val)],
         eval_metric='auc',
-        callbacks=callbacks,
-        categorical_feature=categorical_features
+        callbacks=callbacks
     )
 
-    # 6. Train Calibration Model
+    # 4. Calibration (Isotonic)
     # Get uncalibrated probabilities on Validation set
     prob_val_raw = lgb_model.predict_proba(X_val)[:, 1]
     
     iso_calibrator = IsotonicRegression(out_of_bounds='clip')
     iso_calibrator.fit(prob_val_raw, y_val)
 
-    # 7. Final Evaluation
+    # 5. Final Evaluation on Test Set
     prob_test_raw = lgb_model.predict_proba(X_test)[:, 1]
     prob_test_cal = iso_calibrator.predict(prob_test_raw)
+    
     y_pred_raw = (prob_test_raw >= 0.5).astype(int)
-
+    
     metrics = {
         'AUC': roc_auc_score(y_test, prob_test_raw),
         'F1 Score': f1_score(y_test, y_pred_raw),
@@ -204,24 +194,35 @@ def run_experiment(run_id):
         'ECE (Calibrated)': compute_ece(y_test, prob_test_cal)
     }
     
-    print(f"Run {run_id+1} Complete: AUC={metrics['AUC']:.4f}, ECE(Cal)={metrics['ECE (Calibrated)']:.4f}")
+    print(f"Run {run_id+1} Result: AUC={metrics['AUC']:.4f}, ECE(Cal)={metrics['ECE (Calibrated)']:.4f}")
     return metrics
 
 def main():
+    # Load Data Once
+    if not os.path.exists(FEAT_DATA_PATH):
+        raise FileNotFoundError(
+            f"Feature file not found at: {FEAT_DATA_PATH}\n"
+            "Please run 'python scripts/1_feature_engineering.py' first."
+        )
+    
+    print("Loading feature data (parquet)...")
+    df = pd.read_parquet(FEAT_DATA_PATH)
+    
+    # Run Experiments
     N_RUNS = 3
     all_results = []
     
-    print(f"Running LightGBM Baseline for {N_RUNS} independent runs...")
+    print(f"Running LightGBM Baseline (Fair Comparison Mode) for {N_RUNS} runs...")
     
     for i in range(N_RUNS):
-        res = run_experiment(i)
+        res = run_experiment(i, df)
         all_results.append(res)
 
-    # Output formatted for Table 1
+    # Output Table
     target_columns = ['AUC', 'F1 Score', 'ECE (Raw)', 'ECE (Calibrated)']
     
     print("\n" + "="*80)
-    print("   LightGBM Results (Formatted for Table 1)   ")
+    print("   LightGBM Results (Fair Comparison / LACE Features)   ")
     print("="*80)
     print(f"{'Metric':<20} | {'Mean':<10} | {'Std':<10} | {'Format: Mean ± Std'}")
     print("-" * 80)

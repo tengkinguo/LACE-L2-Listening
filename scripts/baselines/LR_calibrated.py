@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Created on Fri Nov 28 09:44:16 2025
+Created on Thu Dec  4 16:43:09 2025
 
 @author: T
 """
+
 # -*- coding: utf-8 -*-
 """
 Script: LR_calibrated.py
@@ -12,41 +13,35 @@ Location: scripts/baselines/LR_calibrated.py
 Description:
     Implements the Logistic Regression baseline with Isotonic Calibration.
     
-    This script is designed to reproduce the baseline metrics for Table 1 of the paper.
-    It performs the following steps:
-    1. Preprocessing: Parsing raw logs and extracting behavioral features (e.g., rolling accuracy).
-    2. Splitting: Strict User-level split (60% Train, 20% Val, 20% Test) to prevent data leakage.
-    3. Training: Fits Logistic Regression on the Training set.
-    4. Calibration: Fits Isotonic Regression on the Validation set to correct probability estimates.
-    5. Evaluation: Runs the experiment 3 times (with different random seeds) and reports 
-       the Mean ± Std for the four required metrics: AUC, F1 Score, ECE (Raw), and ECE (Calibrated).
+    CRITICAL UPDATE:
+    To ensure a fair comparison with the LACE model, this script now loads 
+    the feature-engineered data ('fe_data.parquet') instead of raw logs.
+    This grants the baseline access to the exact same lexico-phonological 
+    features (word frequency, phoneme complexity, etc.) used by LACE.
+
+    Pipeline:
+    1. Load Preprocessed Data: Reads 'fe_data.parquet'.
+    2. Split: User-level split (70% Train, 15% Val, 15% Test) matching LACE.
+    3. Train: Logistic Regression on Train set.
+    4. Calibrate: Isotonic Regression on Validation set probabilities.
+    5. Evaluate: Reports AUC, F1, ECE (Raw), ECE (Calibrated) over 3 runs.
 
 Usage:
-    Run from the project root:
     python scripts/baselines/LR_calibrated.py
 """
 
 import os
-import ast
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score, f1_score
 
 # --- Configuration & Path Setup ---
-# Calculate paths relative to this script location
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../"))
-RAW_DATA_PATH = os.path.join(PROJECT_ROOT, "data", "raw", "slam.listen.train")
-
-# Define columns for raw TSV data (no header in original file)
-COLUMN_NAMES = [
-    'user', 'exercise_id', 'instance_id', 'token', 'client',
-    'countries', 'session', 'days', 'time', 'label'
-]
+# Using the exact same feature file as LACE
+FEAT_DATA_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "fe_data.parquet")
 
 # --- Helper Functions ---
 
@@ -71,134 +66,92 @@ def compute_ece(y_true, y_prob, n_bins=10):
             
     return ece
 
-def parse_countries(x):
-    """Parses string representation of lists (e.g., "['CO']") to extract the country code."""
-    try:
-        arr = ast.literal_eval(x)
-        if isinstance(arr, list) and len(arr) > 0:
-            return arr[0]
-        else:
-            return 'Unknown'
-    except Exception:
-        return 'Unknown'
-
-def run_experiment(run_id):
+def run_experiment(run_id, df):
     """
     Runs a single complete experiment iteration.
-    Returns: Dictionary containing the 4 key metrics for the Test set.
+    Args:
+        run_id: Int, seed offset.
+        df: DataFrame, loaded feature data.
     """
     print(f"\n--- Starting Run {run_id+1}/3 ---")
     
-    # 1. Load Data
-    if not os.path.exists(RAW_DATA_PATH):
-        raise FileNotFoundError(f"Raw data not found at: {RAW_DATA_PATH}")
-    
-    # Load as string first to avoid type inference errors
-    df = pd.read_csv(RAW_DATA_PATH, header=None, names=COLUMN_NAMES, sep='\t', dtype=str)
-
-    # 2. Preprocessing & Feature Engineering
-    df['days'] = pd.to_numeric(df['days'], errors='coerce')
-    df['time'] = pd.to_numeric(df['time'], errors='coerce')
-    df['country'] = df['countries'].apply(parse_countries)
-
-    # Extract token order (last 2 digits of instance_id)
-    df['token_sequence_order'] = (
-        df['instance_id']
-        .str[-2:]
-        .apply(lambda s: pd.to_numeric(s, errors='coerce'))
-        .fillna(0)
-        .astype(int)
-    )
-
-    # Calculate sentence length
-    df['sentence_length'] = df.groupby('exercise_id')['token'].transform('count')
-
-    # Calculate Rolling History Accuracy (Crucial: Avoid data leakage)
-    # Sort by user and time to ensure past events come first
-    df = df.sort_values(by=['user', 'days', 'time', 'token_sequence_order']).reset_index(drop=True)
-    df['label_float'] = pd.to_numeric(df['label'], errors='coerce').fillna(0.0)
-    
-    # Cumulative stats
-    df['cum_correct'] = df.groupby('user')['label_float'].cumsum()
-    df['cum_total'] = df.groupby('user').cumcount() + 1
-    
-    # Accuracy up to the *previous* attempt
-    df['user_history_accuracy'] = (df['cum_correct'] - df['label_float']) / (df['cum_total'] - 1)
-    df['user_history_accuracy'] = df['user_history_accuracy'].fillna(0.5) # Cold start
-
-    # Handle missing values
-    for col in ['days', 'time']:
-        if df[col].isnull().any(): df[col] = df[col].fillna(df[col].median())
-    for col in ['client', 'country', 'session']:
-        df[col] = df[col].fillna('Unknown')
-
-    # 3. User-Level Data Splitting
+    # 1. User-Level Data Splitting (Match LACE logic: 70/15/15)
     unique_users = df['user'].unique()
     
-    # Dynamic seed based on run_id ensures different splits for each run
+    # Dynamic seed ensures we test robustness across different splits
+    # Note: To exactly match LACE's specific run, you would use seed=42 for run 0.
     current_seed = 42 + run_id 
     np.random.seed(current_seed)
     np.random.shuffle(unique_users)
 
     n_users = len(unique_users)
-    n_train = int(n_users * 0.6)
-    n_val = int(n_users * 0.2)
+    n_train = int(n_users * 0.70)
+    n_val = int(n_users * 0.15)
     
-    train_users = unique_users[:n_train]
-    val_users = unique_users[n_train : n_train + n_val]
-    test_users = unique_users[n_train + n_val:]
+    train_users = set(unique_users[:n_train])
+    val_users = set(unique_users[n_train : n_train + n_val])
+    test_users = set(unique_users[n_train + n_val:])
 
-    train_df = df[df['user'].isin(train_users)].reset_index(drop=True)
-    val_df = df[df['user'].isin(val_users)].reset_index(drop=True)
-    test_df = df[df['user'].isin(test_users)].reset_index(drop=True)
+    # Boolean indexing is faster
+    train_mask = df['user'].isin(train_users)
+    val_mask = df['user'].isin(val_users)
+    test_mask = df['user'].isin(test_users)
 
-    # 4. Feature Preparation
-    numeric_features = ['days', 'time', 'token_sequence_order', 'sentence_length', 'user_history_accuracy']
-    categorical_features = ['client', 'country', 'session']
-    features = numeric_features + categorical_features
-
-    y_train = train_df['label_float'].values
-    y_val = val_df['label_float'].values
-    y_test = test_df['label_float'].values
-
-    X_train = train_df[features]
-    X_val = val_df[features]
-    X_test = test_df[features]
-
-    # Pipeline: Scale numerics, One-Hot encode categoricals
-    preprocessor = ColumnTransformer(transformers=[
-        ('num', StandardScaler(), numeric_features),
-        ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_features)
-    ])
+    # 2. Feature Selection
+    # Using the pre-scaled features generated in 1_feature_engineering.py
+    # These match the inputs to LACE's MLPs.
+    feature_cols = [
+        # Lexical Features
+        'word_freq_scaled',
+        'word_length_scaled',
+        
+        # Phonological Features
+        'num_syllables_scaled',
+        'is_challenging_phoneme', # Binary, no scaling needed but safe to include if 0/1
+        
+        # Behavioral / Context Features
+        'user_history_accuracy_scaled',
+        'days_scaled',
+        'time_scaled'
+    ]
     
-    # Fit on Train, transform others
-    X_train_processed = preprocessor.fit_transform(X_train)
-    X_val_processed = preprocessor.transform(X_val)
-    X_test_processed = preprocessor.transform(X_test)
+    target_col = 'label'
 
-    # 5. Train Logistic Regression
+    X_train = df.loc[train_mask, feature_cols].values
+    y_train = df.loc[train_mask, target_col].values.astype(int)
+    
+    X_val = df.loc[val_mask, feature_cols].values
+    y_val = df.loc[val_mask, target_col].values.astype(int)
+    
+    X_test = df.loc[test_mask, feature_cols].values
+    y_test = df.loc[test_mask, target_col].values.astype(int)
+
+    print(f"Train size: {len(X_train)}, Val size: {len(X_val)}, Test size: {len(X_test)}")
+
+    # 3. Train Logistic Regression
+    # class_weight='balanced' handles the 17.5% error rate imbalance
     lr_model = LogisticRegression(
         solver='liblinear',
         class_weight='balanced',
         random_state=current_seed,
         max_iter=1000
     )
-    lr_model.fit(X_train_processed, y_train)
+    lr_model.fit(X_train, y_train)
 
-    # 6. Fit Calibration Model (Isotonic)
-    # Use Validation set probabilities to fit the calibrator
-    prob_val_raw = lr_model.predict_proba(X_val_processed)[:, 1]
+    # 4. Fit Calibration Model (Isotonic)
+    # Use Validation set probabilities to fit the calibrator to avoid overfitting
+    prob_val_raw = lr_model.predict_proba(X_val)[:, 1]
+    
     iso_calibrator = IsotonicRegression(out_of_bounds='clip')
     iso_calibrator.fit(prob_val_raw, y_val)
 
-    # 7. Final Evaluation on Test Set
-    prob_test_raw = lr_model.predict_proba(X_test_processed)[:, 1]
+    # 5. Final Evaluation on Test Set
+    prob_test_raw = lr_model.predict_proba(X_test)[:, 1]
     prob_test_cal = iso_calibrator.predict(prob_test_raw)
     
     # For F1, use default threshold of 0.5
     y_pred_raw = (prob_test_raw >= 0.5).astype(int)
     
-    # Return the exact 4 metrics required for Table 1
     metrics = {
         'AUC': roc_auc_score(y_test, prob_test_raw),
         'F1 Score': f1_score(y_test, y_pred_raw),
@@ -206,26 +159,35 @@ def run_experiment(run_id):
         'ECE (Calibrated)': compute_ece(y_test, prob_test_cal)
     }
     
-    print(f"Run {run_id+1} Complete: AUC={metrics['AUC']:.4f}, ECE(Cal)={metrics['ECE (Calibrated)']:.4f}")
+    print(f"Result: AUC={metrics['AUC']:.4f}, ECE(Cal)={metrics['ECE (Calibrated)']:.4f}")
     return metrics
 
 def main():
-    # Number of runs to calculate Mean +/- Std
+    # Load Data Once
+    if not os.path.exists(FEAT_DATA_PATH):
+        raise FileNotFoundError(
+            f"Feature file not found at: {FEAT_DATA_PATH}\n"
+            "Please run 'python scripts/1_feature_engineering.py' first."
+        )
+    
+    print("Loading feature data (parquet)...")
+    df = pd.read_parquet(FEAT_DATA_PATH)
+    
+    # Run Experiments
     N_RUNS = 3
     all_results = []
     
-    print(f"Running Logistic Regression Baseline for {N_RUNS} independent runs...")
+    print(f"Running Logistic Regression Baseline (Fair Comparison Mode) for {N_RUNS} runs...")
     
-    # Execute runs
     for i in range(N_RUNS):
-        res = run_experiment(i)
+        res = run_experiment(i, df)
         all_results.append(res)
 
-    # Calculate Mean and Std for Table 1
+    # Output Table
     target_columns = ['AUC', 'F1 Score', 'ECE (Raw)', 'ECE (Calibrated)']
     
     print("\n" + "="*80)
-    print("   Logistic Regression Results (Formatted for Table 1)   ")
+    print("   Logistic Regression Results (Fair Comparison / LACE Features)   ")
     print("="*80)
     print(f"{'Metric':<20} | {'Mean':<10} | {'Std':<10} | {'Format: Mean ± Std'}")
     print("-" * 80)
@@ -235,7 +197,6 @@ def main():
         mean_val = np.mean(values)
         std_val = np.std(values)
         
-        # Determine strict formatting based on the paper's table style
         formatted_str = f"{mean_val:.3f} ± {std_val:.3f}"
         
         print(f"{col:<20} | {mean_val:.4f}     | {std_val:.4f}     | {formatted_str}")
