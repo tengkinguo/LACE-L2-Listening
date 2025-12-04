@@ -136,7 +136,7 @@ def main():
     
     # Define the config used for E1_LACE (must match training)
     config = {
-        "use_hist_pos_phoneme": True,
+        "use_hist_pos_phoneme": False,
         "use_lexical": True,
         "use_phoneme": True,
         "use_context": False,

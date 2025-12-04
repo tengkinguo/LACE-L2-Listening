@@ -248,13 +248,13 @@ if __name__ == "__main__":
     CONFIGS = {
         "A0_SeqOnly": {"use_hist_pos_phoneme": False, "use_lexical": False, "use_phoneme": False, "use_context": False, "use_prev_interaction": False},
         "A1_Paradox": {"use_hist_pos_phoneme": True,  "use_lexical": False, "use_phoneme": False, "use_context": False, "use_prev_interaction": False},
-        "C1_LexPho":  {"use_hist_pos_phoneme": True,  "use_lexical": True,  "use_phoneme": True,  "use_context": False, "use_prev_interaction": False},
+        "C1_LexPho":  {"use_hist_pos_phoneme": False,  "use_lexical": True,  "use_phoneme": True,  "use_context": False, "use_prev_interaction": False},
         
         # E1: LACE (Proposed in paper) - No User/Country Context
-        "E1_LACE":    {"use_hist_pos_phoneme": True,  "use_lexical": True,  "use_phoneme": True,  "use_context": False, "use_prev_interaction": True},
+        "E1_LACE":    {"use_hist_pos_phoneme": False,  "use_lexical": True,  "use_phoneme": True,  "use_context": False, "use_prev_interaction": True},
         
         # E2: Full (Includes User/Country Context) - Optional variant from original code
-        "E2_Full":    {"use_hist_pos_phoneme": True,  "use_lexical": True,  "use_phoneme": True,  "use_context": True,  "use_prev_interaction": True},
+        "E2_Full":    {"use_hist_pos_phoneme": False,  "use_lexical": True,  "use_phoneme": True,  "use_context": True,  "use_prev_interaction": True},
     }
 
     # Choose model to run
