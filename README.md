@@ -7,13 +7,7 @@
 
 This repository contains the official implementation, data samples, and reproduction scripts for the **LACE** framework.
 
-## 📌 Project Information
 
-
--   **License**: MIT
-    
--   **Last Updated**: November 2025
-    
 
 ## 🚀 One-Click Full Reproduction
 
