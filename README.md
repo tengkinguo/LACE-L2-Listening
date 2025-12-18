@@ -24,9 +24,6 @@ Follow the steps below to replicate the experiments and generate the figures pre
 First, clone the repository and install the necessary dependencies and NLTK data.
 
 ```
-# Clone the repository
-git clone [https://github.com/tengkinguo/LACE-L2-Listening.git](https://github.com/tengkinguo/LACE-L2-Listening.git)
-cd LACE-L2-Listening
 
 # Install Python requirements
 pip install -r requirements.txt
