@@ -9,10 +9,7 @@ This repository contains the official implementation, data samples, and reproduc
 
 ## 📌 Project Information
 
--   **Code Repository**: [https://github.com/tengkinguo/LACE-L2-Listening](https://github.com/tengkinguo/LACE-L2-Listening "null")
-    
--   **Permanent Archive & DOI**: [10.5281/zenodo.17746338](https://doi.org/10.5281/zenodo.17746338 "null") (v1.0, November 2025)
-    
+
 -   **License**: MIT
     
 -   **Last Updated**: November 2025
